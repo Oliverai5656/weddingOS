@@ -2,12 +2,6 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const distDir = path.join(__dirname, "..", "dist");
-const entrypoint = `const http = require("node:http");
-const fs = require("node:fs");
-const path = require("node:path");
-
-const root = __dirname;
-const port = Number(process.env.PORT || 3000);
 const types = {
   ".html": "text/html; charset=utf-8",
   ".css": "text/css; charset=utf-8",
@@ -23,20 +17,48 @@ const types = {
   ".woff2": "font/woff2"
 };
 
-http.createServer((req, res) => {
-  const url = new URL(req.url, "http://localhost");
-  const requestedPath = decodeURIComponent(url.pathname === "/" ? "/index.html" : url.pathname);
-  let filePath = path.resolve(root, "." + requestedPath);
+const assets = {};
 
-  if (!filePath.startsWith(root + path.sep) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
-    filePath = path.join(root, "index.html");
+function collectAssets(dir) {
+  for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
+    const fullPath = path.join(dir, item.name);
+    if (item.isDirectory()) {
+      collectAssets(fullPath);
+      continue;
+    }
+
+    if (item.name === "index.js") {
+      continue;
+    }
+
+    const route = "/" + path.relative(distDir, fullPath).replace(/\\/g, "/");
+    const ext = path.extname(fullPath);
+    assets[route] = {
+      body: fs.readFileSync(fullPath, "utf8"),
+      type: types[ext] || "text/plain; charset=utf-8"
+    };
   }
+}
 
-  res.writeHead(200, { "content-type": types[path.extname(filePath)] || "application/octet-stream" });
-  fs.createReadStream(filePath).pipe(res);
-}).listen(port, () => {
-  console.log("O&S Wedding Dashboard running on " + port);
-});
+collectAssets(distDir);
+
+const entrypoint = `const assets = ${JSON.stringify(assets)};
+
+async function handleFetch(request) {
+  const url = new URL(request.url);
+  const path = url.pathname === "/" ? "/index.html" : url.pathname;
+  const asset = assets[path] || assets["/index.html"];
+
+  return new Response(asset.body, {
+    headers: {
+      "content-type": asset.type,
+      "cache-control": path === "/index.html" ? "no-cache" : "public, max-age=31536000, immutable"
+    }
+  });
+}
+
+export { handleFetch as fetch };
+export default { fetch: handleFetch };
 `;
 
 fs.mkdirSync(distDir, { recursive: true });
