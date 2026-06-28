@@ -1,0 +1,124 @@
+/* === O&S 婚礼 - UI 整齐化补充样式 === */
+
+/* 账号选择面板 */
+.account-panel {
+  max-width: 520px;
+  margin: 0 auto;
+}
+.account-panel h2 {
+  margin: 0 0 4px;
+}
+.account-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+.account-chip {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  text-align: left;
+  gap: 2px;
+  padding: 12px 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--ink);
+  font-weight: 650;
+  transition: border-color .15s, transform .05s;
+}
+.account-chip:hover {
+  border-color: var(--line-strong);
+}
+.account-chip:active {
+  transform: translateY(1px);
+}
+.account-chip span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+.register-fold {
+  margin-top: 18px;
+  border-top: 1px dashed var(--line);
+  padding-top: 12px;
+}
+.register-fold summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-weight: 650;
+  font-size: 13px;
+}
+
+/* 侧栏账号切换 */
+.account-switch {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+.account-switch span {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+  letter-spacing: .02em;
+}
+.account-switch select {
+  min-height: 38px;
+}
+
+/* 侧栏导航 */
+.side-nav {
+  display: grid;
+  gap: 6px;
+  margin: 6px 0 14px;
+}
+.side-nav a {
+  display: block;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  text-decoration: none;
+  color: var(--ink);
+  font-weight: 650;
+  font-size: 14px;
+  border: 1px solid transparent;
+  background: var(--paper);
+}
+.side-nav a:hover {
+  border-color: var(--line);
+}
+.side-nav a.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* Dashboard 概览网格 */
+.overview-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: 4px;
+}
+
+/* Manage 页头 */
+.manage-head {
+  display: grid;
+  gap: 4px;
+  padding: 18px 20px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+.manage-head h2 { margin: 0; }
+
+/* Manage 双栏 */
+.manage-grid {
+  align-items: start;
+}
+.manage-grid .compact-panel.full {
+  grid-column: 1 / -1;
+}
+
+/* 让 dashboard 卡片在窄屏整齐堆叠 */
+@media (max-width: 920px) {
+  .overview-grid { grid-template-columns: 1fr; }
+  .manage-grid { grid-template-columns: 1fr; }
+}

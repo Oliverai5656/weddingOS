@@ -28,9 +28,14 @@ const emptyDb = () => ({
 });
 
 function ensureDb() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!fs.existsSync(DB_FILE)) {
-    fs.writeFileSync(DB_FILE, JSON.stringify(emptyDb(), null, 2));
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (!fs.existsSync(DB_FILE)) {
+      fs.writeFileSync(DB_FILE, JSON.stringify(emptyDb(), null, 2));
+    }
+  } catch (error) {
+    // 只读文件系统（Vercel serverless 等）无法写入本地 json。
+    // 此时必须 DATA_BACKEND=supabase，否则读写会失败。
   }
 }
 
@@ -339,6 +344,34 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, { user, weddings });
   }
 
+  if (method === "POST" && url.pathname === "/api/bootstrap") {
+    // 首次使用（完全没有用户）：建立默认 Oliver + 空婚礼，并直接登入。
+    // 已有用户：不自动登入，返回用户列表让前端选择/登入，避免把伴侣的 session 盖掉。
+    let user = null;
+    let weddingId = "";
+    if (db.users.length === 0) {
+      user = { id: id("usr"), name: "Oliver", email: "oliver@local", created_at: nowIso() };
+      db.users.push(user);
+      const wedding = {
+        id: id("wed"),
+        name: "O&S 婚礼计划",
+        date: "",
+        total_budget: 0,
+        size_estimate: 0,
+        created_by: user.id,
+        updated_at: nowIso(),
+        created_at: nowIso()
+      };
+      db.weddings.push(wedding);
+      db.weddingMembers.push({ wedding_id: wedding.id, user_id: user.id, joined_at: nowIso() });
+      recordActivity(db, wedding.id, user.id, "created", "建立共享婚礼计划");
+      await writeDb(db);
+      weddingId = wedding.id;
+    }
+    const users = db.users.map((item) => ({ id: item.id, name: item.name, email: item.email }));
+    return sendJson(res, 200, { user, weddingId, users });
+  }
+
   if (method === "POST" && url.pathname === "/api/weddings") {
     const body = await parseBody(req);
     if (!requireUser(db, body.userId)) return sendError(res, 401, "请先建立或登入用户。");
@@ -630,7 +663,7 @@ function serveStatic(req, res, url) {
   fs.createReadStream(filePath).pipe(res);
 }
 
-const server = http.createServer(async (req, res) => {
+async function handler(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   try {
     if (url.pathname.startsWith("/api/")) return await handleApi(req, res, url);
@@ -638,9 +671,16 @@ const server = http.createServer(async (req, res) => {
   } catch (error) {
     return sendError(res, 500, error.message || "Server error.");
   }
-});
+}
 
-ensureDb();
-server.listen(PORT, () => {
-  console.log(`Wedding Plan running at http://localhost:${PORT}`);
-});
+module.exports = handler;
+
+// 本地开发：npm start 直接跑长驻 server。
+// Vercel / serverless：由 api/[...slug].js 引入 handler，不执行下面的 listen。
+if (require.main === module) {
+  ensureDb();
+  const server = http.createServer(handler);
+  server.listen(PORT, () => {
+    console.log(`Wedding Plan running at http://localhost:${PORT}`);
+  });
+}

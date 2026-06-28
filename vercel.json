@@ -1,0 +1,10 @@
+{
+  "buildCommand": "echo \"Vercel: no build step, static served from public/\"",
+  "outputDirectory": "public",
+  "functions": {
+    "api/[...slug].js": {
+      "memory": 256,
+      "maxDuration": 10
+    }
+  }
+}
