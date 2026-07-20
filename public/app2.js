@@ -64,6 +64,7 @@ async function api(path, options = {}) {
     if (!type.includes("application/json")) throw new Error("NO_API_BACKEND");
     const payload = await response.json();
     if (!response.ok) {
+      if (response.status >= 500) throw new Error("NO_API_BACKEND");
       const error = new Error(payload.error || "请求失败。");
       error.isApiResponse = true;
       throw error;
