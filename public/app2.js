@@ -16,6 +16,12 @@ const money = new Intl.NumberFormat("en-MY", { style: "currency", currency: "MYR
 const dateText = new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric" });
 const LOCAL_DB_KEY = "os-wedding-live-db";
 const CACHED_USER_KEY = "os-wedding-user";
+const LAST_USERNAME_KEY = "os-wedding-last-username";
+const SESSION_TOKEN_KEY = "os-wedding-session-token";
+const FIXED_ACCOUNTS = Object.freeze({
+  oliver: { name: "Oliver", email: "oliver@local", passwordHash: "ac07ebf3bc8fa7cecc910f5bfa6a557c115eb2f0e3f391f9cf9aea11b5f7b005" },
+  sherine: { name: "Sherine", email: "sherine@local", passwordHash: "3056d0479798773fe2da0d6e6afa18bd05bb6a9af2cb49b84519a647fe4649b0" }
+});
 
 function cacheUser(user) {
   if (user) localStorage.setItem(CACHED_USER_KEY, JSON.stringify(user));
@@ -45,17 +51,26 @@ function escapeHtml(value) {
 
 async function api(path, options = {}) {
   try {
+    const token = localStorage.getItem(SESSION_TOKEN_KEY);
     const response = await fetch(path, {
       ...options,
-      headers: { "content-type": "application/json", ...(options.headers || {}) }
+      headers: {
+        "content-type": "application/json",
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+        ...(options.headers || {})
+      }
     });
     const type = response.headers.get("content-type") || "";
     if (!type.includes("application/json")) throw new Error("NO_API_BACKEND");
     const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || "请求失败。");
+    if (!response.ok) {
+      const error = new Error(payload.error || "请求失败。");
+      error.isApiResponse = true;
+      throw error;
+    }
     return payload;
   } catch (error) {
-    if (error.message !== "NO_API_BACKEND" && !path.startsWith("/api/")) throw error;
+    if (error.isApiResponse || (error.message !== "NO_API_BACKEND" && !path.startsWith("/api/"))) throw error;
     return localApi(path, options);
   }
 }
@@ -94,6 +109,12 @@ function localId(prefix) {
 
 function localNowIso() {
   return new Date().toISOString();
+}
+
+async function localPasswordHash(password) {
+  const bytes = new TextEncoder().encode(String(password || ""));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function localIsoDate(date) {
@@ -206,13 +227,47 @@ function localWeddingPayload(db, weddingId) {
       ceremony_ids: db.guestCeremonies.filter((link) => link.guest_id === guest.id && ceremonyIds.has(link.ceremony_id)).map((link) => link.ceremony_id)
     })),
     notes: db.notes.filter((item) => item.wedding_id === weddingId),
-    activity: db.activity.filter((item) => item.wedding_id === weddingId).slice(0, 8).map((item) => ({ ...item, user_name: db.users.find((user) => user.id === item.user_id)?.name || "O&S" }))
+    activity: db.activity
+      .filter((item) => item.wedding_id === weddingId)
+      .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
+      .map((item) => ({ ...item, user_name: db.users.find((user) => user.id === item.user_id)?.name || "O&S" }))
   };
 }
 
 function recordLocalActivity(db, weddingId, userId, label) {
   db.activity.unshift({ id: localId("act"), wedding_id: weddingId, user_id: userId, action: "updated", label, created_at: localNowIso() });
-  db.activity = db.activity.slice(0, 80);
+}
+
+function ensureLocalAccounts(db) {
+  let changed = false;
+  const accounts = Object.values(FIXED_ACCOUNTS).map((account) => {
+    let user = db.users.find((item) => String(item.name || "").toLowerCase() === account.name.toLowerCase());
+    if (!user) {
+      user = { id: localId("usr"), name: account.name, email: account.email, created_at: localNowIso() };
+      db.users.push(user);
+      changed = true;
+    } else if (user.name !== account.name || user.email !== account.email) {
+      user.name = account.name;
+      user.email = account.email;
+      changed = true;
+    }
+    return user;
+  });
+  let wedding = db.weddings[0];
+  if (!wedding) {
+    wedding = { id: localId("wed"), name: "O&S 婚礼计划", date: "", total_budget: 0, size_estimate: 0, created_by: accounts[0].id, updated_at: localNowIso(), created_at: localNowIso() };
+    db.weddings.push(wedding);
+    recordLocalActivity(db, wedding.id, accounts[0].id, "建立共享婚礼计划");
+    changed = true;
+  }
+  accounts.forEach((user) => {
+    if (!db.weddingMembers.some((member) => member.wedding_id === wedding.id && member.user_id === user.id)) {
+      db.weddingMembers.push({ wedding_id: wedding.id, user_id: user.id, joined_at: localNowIso() });
+      changed = true;
+    }
+  });
+  if (changed) writeLocalDb(db);
+  return { accounts, wedding };
 }
 
 async function localApi(path, options = {}) {
@@ -224,38 +279,21 @@ async function localApi(path, options = {}) {
 
   if (url.pathname === "/api/health") return { ok: true, backend: "browser-local", at: localNowIso() };
   if (method === "POST" && url.pathname === "/api/bootstrap") {
-    let user = null;
-    let weddingId = "";
-    if (db.users.length === 0) {
-      user = { id: localId("usr"), name: "Oliver", email: "oliver@local", created_at: localNowIso() };
-      db.users.push(user);
-      const wedding = { id: localId("wed"), name: "O&S 婚礼计划", date: "", total_budget: 0, size_estimate: 0, created_by: user.id, updated_at: localNowIso(), created_at: localNowIso() };
-      db.weddings.push(wedding);
-      db.weddingMembers.push({ wedding_id: wedding.id, user_id: user.id, joined_at: localNowIso() });
-      recordLocalActivity(db, wedding.id, user.id, "建立共享婚礼计划");
-      writeLocalDb(db);
-      weddingId = wedding.id;
-    }
-    const users = db.users.map((item) => ({ id: item.id, name: item.name, email: item.email }));
-    return { user, weddingId, users };
+    const setup = ensureLocalAccounts(db);
+    const users = setup.accounts.map(({ id, name, email }) => ({ id, name, email }));
+    return { user: null, weddingId: setup.wedding.id, users };
   }
   if (method === "POST" && url.pathname === "/api/users") {
-    const email = String(body.email || "").trim().toLowerCase();
-    const name = String(body.name || "").trim();
-    if (!email || !name) throw new Error("请填写名字和 Email。");
-    let user = db.users.find((item) => item.email === email);
-    if (!user) {
-      user = { id: localId("usr"), name, email, created_at: localNowIso() };
-      db.users.push(user);
-      writeLocalDb(db);
-    }
-    return { user };
+    throw new Error("此计划只开放 Oliver 与 Sherine 两个账号。");
   }
   if (method === "POST" && url.pathname === "/api/login") {
-    const email = String(body.email || "").trim().toLowerCase();
-    const user = db.users.find((item) => item.email === email);
-    if (!user) throw new Error("找不到这个 Email 的用户。");
-    return { user };
+    const username = String(body.username || "").trim().toLowerCase();
+    const password = String(body.password || "");
+    const account = FIXED_ACCOUNTS[username];
+    if (!account || account.passwordHash !== await localPasswordHash(password)) throw new Error("用户名或密码不正确。");
+    const setup = ensureLocalAccounts(db);
+    const user = setup.accounts.find((item) => item.name.toLowerCase() === username);
+    return { user, token: `local:${user.id}` };
   }
   if (method === "GET" && url.pathname === "/api/session") {
     const userId = url.searchParams.get("userId");
@@ -375,6 +413,7 @@ async function boot() {
       } else {
         localStorage.removeItem("userId");
         localStorage.removeItem("weddingId");
+        localStorage.removeItem(SESSION_TOKEN_KEY);
       }
     }
   }
@@ -422,26 +461,18 @@ function topbar() {
 }
 
 function accountPanel() {
-  const quick = state.users.length
-    ? state.users.map((u) => `<button class="account-chip" data-action="quickLogin" data-userid="${escapeHtml(u.id)}"><strong>${escapeHtml(u.name)}</strong><span>${escapeHtml(u.email)}</span></button>`).join("")
-    : `<p class="copy">还没有用户，先在下方建立第一个。</p>`;
+  const lastUsername = localStorage.getItem(LAST_USERNAME_KEY) || "Oliver";
+  const accounts = state.users.length ? state.users : Object.values(FIXED_ACCOUNTS);
+  const options = accounts.map((user) => `<option value="${escapeHtml(user.name)}" ${user.name === lastUsername ? "selected" : ""}>${escapeHtml(user.name)}</option>`).join("");
   return `
     <section class="panel account-panel">
-      <h2>选择账号登入</h2>
-      <p class="copy">这是你和老婆共用的工作区。选择你的账号继续；换设备也会记住你。</p>
-      <div class="account-list">${quick}</div>
+      <h2>登入你们的婚礼计划</h2>
+      <p class="copy">用户名已为你准备好。选择 Oliver 或 Sherine，只需输入密码即可继续。</p>
       <form class="form-grid" data-form="login" style="margin-top: 16px;">
-        <label>用 Email 打开<input name="email" type="email" placeholder="you@example.com"></label>
-        <button class="secondary" type="submit">登入</button>
+        <label>用户名<select name="username" autocomplete="username">${options}</select></label>
+        <label>密码<input name="password" type="password" autocomplete="current-password" inputmode="numeric" required autofocus placeholder="输入密码"></label>
+        <button type="submit">登入 Dashboard</button>
       </form>
-      <details class="register-fold">
-        <summary>建立新用户（例如老婆）</summary>
-        <form class="form-grid" data-form="register" style="margin-top: 12px;">
-          <label>名字<input name="name" autocomplete="name" placeholder="Oliver"></label>
-          <label>Email<input name="email" autocomplete="email" type="email" placeholder="you@example.com"></label>
-          <button type="submit">建立用户</button>
-        </form>
-      </details>
     </section>
   `;
 }
@@ -648,7 +679,7 @@ function controlsPanel() {
       </div>
       <div class="side-card">
         <strong>最近更新</strong>
-        ${state.data.activity.length ? state.data.activity.slice(0, 2).map((item) => `<span>${escapeHtml(item.label)}</span>`).join("") : `<span>更新记录会显示在这里。</span>`}
+        ${state.data.activity.length ? state.data.activity.slice(0, 2).map((item) => `<span><b>${escapeHtml(item.user_name)}</b> · ${escapeHtml(item.label)}</span>`).join("") : `<span>更新记录会显示在这里。</span>`}
       </div>
     </section>
   `;
@@ -717,7 +748,7 @@ function todaySummary() {
         <span>${latestActivity.length ? "最近记录" : "准备开始"}</span>
       </div>
       <div class="activity-list">
-        ${latestActivity.length ? latestActivity.map((item) => `<span>${escapeHtml(item.label)}</span>`).join("") : `<span>更新记录会显示在这里。</span>`}
+        ${latestActivity.length ? latestActivity.map((item) => `<span><b>${escapeHtml(item.user_name)}</b> · ${escapeHtml(item.label)}</span>`).join("") : `<span>更新记录会显示在这里。</span>`}
       </div>
       <button data-action="createInvite">建立伴侣邀请链接</button>
     </section>
@@ -818,9 +849,47 @@ function guestPanel() {
 }
 
 function accountSwitcher() {
-  if (!state.users.length) return "";
-  const opts = state.users.map((u) => `<option value="${u.id}" ${state.user && u.id === state.user.id ? "selected" : ""}>${escapeHtml(u.name)}</option>`).join("");
-  return `<label class="account-switch"><span>切换账号</span><select data-action="switchUser">${opts}</select></label>`;
+  if (!state.user) return "";
+  return `<div class="signed-in-user"><span>当前账号</span><strong>${escapeHtml(state.user.name)}</strong></div>`;
+}
+
+function activityTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "时间未记录";
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit"
+  }).format(date);
+}
+
+function activityPanel() {
+  const items = state.data.activity || [];
+  return `
+    <section class="panel activity-history full" id="history">
+      <div class="card-heading">
+        <div>
+          <h2>更新历史</h2>
+          <p class="copy">每次资料更新都会记录账号、更新内容与时间。</p>
+        </div>
+        <span>${items.length} 条记录</span>
+      </div>
+      <div class="history-list">
+        ${items.length ? items.map((item) => `
+          <div class="history-row">
+            <span class="history-avatar" aria-hidden="true">${escapeHtml(item.user_name?.slice(0, 1) || "O")}</span>
+            <div>
+              <strong>${escapeHtml(item.user_name || "O&S")}</strong>
+              <p>${escapeHtml(item.label)}</p>
+            </div>
+            <time datetime="${escapeHtml(item.created_at)}">${escapeHtml(activityTime(item.created_at))}</time>
+          </div>
+        `).join("") : `<div class="empty">保存资料后，记录会显示在这里。</div>`}
+      </div>
+    </section>
+  `;
 }
 
 function mainApp() {
@@ -852,6 +921,7 @@ function dashboardView() {
     <div class="dashboard-grid overview-grid">
       ${foundationSummary()}
     </div>
+    ${activityPanel()}
     ${inspirationPanel()}
   `;
 }
@@ -867,6 +937,7 @@ function manageView() {
       ${taskPanel()}
       ${budgetPanel()}
       ${guestPanel()}
+      ${activityPanel()}
     </div>
   `;
 }
@@ -939,10 +1010,19 @@ app.addEventListener("submit", async (event) => {
       const result = await api("/api/login", { method: "POST", body: JSON.stringify(data) });
       state.user = result.user;
       localStorage.setItem("userId", result.user.id);
+      localStorage.setItem(LAST_USERNAME_KEY, result.user.name);
+      localStorage.setItem(SESSION_TOKEN_KEY, result.token);
       cacheUser(result.user);
+      const session = await api(`/api/session?userId=${encodeURIComponent(result.user.id)}`);
+      state.weddings = session.weddings;
+      state.weddingId = session.weddings[0]?.id || "";
+      if (state.weddingId) {
+        localStorage.setItem("weddingId", state.weddingId);
+        await loadWedding(state.weddingId, false);
+      }
       history.replaceState({}, "", "#/dashboard");
       state.view = "dashboard";
-      state.message = "已登入。";
+      state.message = `已登入：${result.user.name}`;
     }
     if (kind === "onboarding") {
       state.data = await api("/api/onboarding", {
@@ -997,6 +1077,7 @@ app.addEventListener("click", async (event) => {
     if (action === "logout") {
       localStorage.removeItem("userId");
       localStorage.removeItem("weddingId");
+      localStorage.removeItem(SESSION_TOKEN_KEY);
       cacheUser(null);
       state.user = null;
       state.users = [];
@@ -1013,25 +1094,6 @@ app.addEventListener("click", async (event) => {
       state.message = "已刷新最新资料。";
       render();
     }
-
-  if (action === "quickLogin") {
-    const userId = target.dataset.userid;
-    const user = state.users.find((u) => u.id === userId);
-    if (!user) return;
-    state.user = user;
-    localStorage.setItem("userId", user.id);
-    cacheUser(user);
-    state.message = `已登入：${user.name}`;
-    try {
-      const session = await api(`/api/session?userId=${encodeURIComponent(user.id)}`);
-      state.weddings = session.weddings;
-      if (!state.weddingId && session.weddings[0]) state.weddingId = session.weddings[0].id;
-    } catch (e) {}
-    if (state.weddingId) await loadWedding(state.weddingId, false);
-    history.replaceState({}, "", "#/dashboard");
-    state.view = "dashboard";
-    render();
-  }
 
     if (action === "createInvite") {
       const result = await api(`/api/weddings/${state.weddingId}/invites`, {
@@ -1074,25 +1136,6 @@ app.addEventListener("click", async (event) => {
 
 
   app.addEventListener("change", async (event) => {
-    const sw = event.target.closest("[data-action='switchUser']");
-    if (sw) {
-      const userId = sw.value;
-      const user = state.users.find((u) => u.id === userId);
-      if (!user) return;
-      state.user = user;
-      localStorage.setItem("userId", user.id);
-      cacheUser(user);
-      state.message = `已切换：${user.name}`;
-      try {
-        const session = await api(`/api/session?userId=${encodeURIComponent(user.id)}`);
-        state.weddings = session.weddings;
-        state.weddingId = session.weddings[0] ? session.weddings[0].id : "";
-        if (state.weddingId) localStorage.setItem("weddingId", state.weddingId);
-      } catch (e) {}
-      if (state.weddingId) await loadWedding(state.weddingId, false);
-      render();
-      return;
-    }
     const target = event.target.closest("[data-action='selectWedding']");
     if (!target) return;
     await loadWedding(target.value);

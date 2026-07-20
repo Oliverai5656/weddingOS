@@ -8,6 +8,12 @@
 .account-panel h2 {
   margin: 0 0 4px;
 }
+.account-panel form {
+  margin-top: 20px;
+}
+.account-panel button[type="submit"] {
+  min-height: 48px;
+}
 .account-list {
   display: grid;
   gap: 10px;
@@ -66,6 +72,65 @@
   min-height: 38px;
 }
 
+.signed-in-user {
+  display: grid;
+  gap: 3px;
+  padding: 12px 14px;
+  border: 1px solid rgba(255, 234, 190, 0.3);
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.08);
+}
+.signed-in-user span {
+  color: #ffe8c0;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+.signed-in-user strong {
+  color: #f2c777;
+  font-size: 16px;
+}
+
+.activity-history {
+  min-width: 0;
+}
+.history-list {
+  display: grid;
+  margin-top: 16px;
+  border-top: 1px solid var(--line);
+}
+.history-row {
+  min-height: 70px;
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+}
+.history-avatar {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff7e8;
+  font-family: Georgia, "Times New Roman", serif;
+  font-weight: 800;
+}
+.history-row p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+.history-row time {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 /* 侧栏导航 */
 .side-nav {
   display: grid;
@@ -121,4 +186,13 @@
 @media (max-width: 920px) {
   .overview-grid { grid-template-columns: 1fr; }
   .manage-grid { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 560px) {
+  .history-row {
+    grid-template-columns: 36px minmax(0, 1fr);
+  }
+  .history-row time {
+    grid-column: 2;
+  }
 }

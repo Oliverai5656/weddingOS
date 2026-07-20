@@ -12,6 +12,11 @@ const PORT = Number(process.env.PORT || 4173);
 const PUBLIC_DIR = path.join(ROOT, "public");
 const DATA_DIR = path.join(ROOT, "data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
+const SESSION_SECRET = process.env.SESSION_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || "os-wedding-local-development-session-key";
+const FIXED_ACCOUNTS = Object.freeze({
+  oliver: { name: "Oliver", email: "oliver@local", passwordHash: "ac07ebf3bc8fa7cecc910f5bfa6a557c115eb2f0e3f391f9cf9aea11b5f7b005" },
+  sherine: { name: "Sherine", email: "sherine@local", passwordHash: "3056d0479798773fe2da0d6e6afa18bd05bb6a9af2cb49b84519a647fe4649b0" }
+});
 
 const emptyDb = () => ({
   users: [],
@@ -60,6 +65,39 @@ function id(prefix) {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function passwordMatches(password, expectedHash) {
+  const actual = crypto.createHash("sha256").update(String(password || "")).digest();
+  const expected = Buffer.from(expectedHash, "hex");
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+}
+
+function createSessionToken(userId) {
+  const payload = Buffer.from(JSON.stringify({ userId, expiresAt: Date.now() + 1000 * 60 * 60 * 24 * 30 })).toString("base64url");
+  const signature = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("base64url");
+  return `${payload}.${signature}`;
+}
+
+function sessionUserId(req) {
+  const header = String(req.headers.authorization || "");
+  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  const [payload, signature] = token.split(".");
+  if (!payload || !signature) return "";
+  const expected = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest();
+  let actual;
+  try {
+    actual = Buffer.from(signature, "base64url");
+  } catch {
+    return "";
+  }
+  if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) return "";
+  try {
+    const session = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    return session.expiresAt > Date.now() ? String(session.userId || "") : "";
+  } catch {
+    return "";
+  }
 }
 
 function sanitizeNumber(value) {
@@ -256,6 +294,58 @@ function requireMember(db, weddingId, userId) {
   return user && membership;
 }
 
+function requireAuthenticatedUser(db, req, userId) {
+  const authenticatedId = sessionUserId(req);
+  return authenticatedId && authenticatedId === userId ? requireUser(db, userId) : null;
+}
+
+function requireAuthenticatedMember(db, req, weddingId, userId) {
+  return requireAuthenticatedUser(db, req, userId) && requireMember(db, weddingId, userId);
+}
+
+function ensureFixedAccounts(db) {
+  let changed = false;
+  const accounts = Object.values(FIXED_ACCOUNTS).map((account) => {
+    let user = db.users.find((item) => String(item.name || "").toLowerCase() === account.name.toLowerCase());
+    if (!user) {
+      user = { id: id("usr"), name: account.name, email: account.email, created_at: nowIso() };
+      db.users.push(user);
+      changed = true;
+    } else if (user.name !== account.name || user.email !== account.email) {
+      user.name = account.name;
+      user.email = account.email;
+      changed = true;
+    }
+    return user;
+  });
+
+  let wedding = db.weddings[0];
+  if (!wedding) {
+    wedding = {
+      id: id("wed"),
+      name: "O&S 婚礼计划",
+      date: "",
+      total_budget: 0,
+      size_estimate: 0,
+      created_by: accounts[0].id,
+      updated_at: nowIso(),
+      created_at: nowIso()
+    };
+    db.weddings.push(wedding);
+    recordActivity(db, wedding.id, accounts[0].id, "created", "建立共享婚礼计划");
+    changed = true;
+  }
+
+  for (const user of accounts) {
+    const exists = db.weddingMembers.some((member) => member.wedding_id === wedding.id && member.user_id === user.id);
+    if (!exists) {
+      db.weddingMembers.push({ wedding_id: wedding.id, user_id: user.id, joined_at: nowIso() });
+      changed = true;
+    }
+  }
+  return { accounts, wedding, changed };
+}
+
 function recordActivity(db, weddingId, userId, action, label) {
   db.activity.unshift({
     id: id("act"),
@@ -265,7 +355,6 @@ function recordActivity(db, weddingId, userId, action, label) {
     label,
     created_at: nowIso()
   });
-  db.activity = db.activity.slice(0, 80);
 }
 
 function weddingPayload(db, weddingId) {
@@ -295,7 +384,7 @@ function weddingPayload(db, weddingId) {
     notes: db.notes.filter((item) => item.wedding_id === weddingId),
     activity: db.activity
       .filter((item) => item.wedding_id === weddingId)
-      .slice(0, 8)
+      .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
       .map((item) => ({
         ...item,
         user_name: db.users.find((user) => user.id === item.user_id)?.name || "Partner"
@@ -313,31 +402,24 @@ async function handleApi(req, res, url) {
   }
 
   if (method === "POST" && url.pathname === "/api/users") {
-    const body = await parseBody(req);
-    const email = String(body.email || "").trim().toLowerCase();
-    const name = String(body.name || "").trim();
-    if (!email || !name) return sendError(res, 400, "请填写名字和 Email。");
-
-    let user = db.users.find((item) => item.email === email);
-    if (!user) {
-      user = { id: id("usr"), name, email, created_at: nowIso() };
-      db.users.push(user);
-      await writeDb(db);
-    }
-    return sendJson(res, 200, { user });
+    return sendError(res, 403, "此计划只开放 Oliver 与 Sherine 两个账号。");
   }
 
   if (method === "POST" && url.pathname === "/api/login") {
     const body = await parseBody(req);
-    const email = String(body.email || "").trim().toLowerCase();
-    const user = db.users.find((item) => item.email === email);
-    if (!user) return sendError(res, 404, "找不到这个 Email 的本机用户。");
-    return sendJson(res, 200, { user });
+    const username = String(body.username || "").trim().toLowerCase();
+    const password = String(body.password || "");
+    const account = FIXED_ACCOUNTS[username];
+    if (!account || !passwordMatches(password, account.passwordHash)) return sendError(res, 401, "用户名或密码不正确。");
+    const setup = ensureFixedAccounts(db);
+    if (setup.changed) await writeDb(db);
+    const user = setup.accounts.find((item) => item.name.toLowerCase() === username);
+    return sendJson(res, 200, { user, token: createSessionToken(user.id) });
   }
 
   if (method === "GET" && url.pathname === "/api/session") {
     const userId = url.searchParams.get("userId");
-    const user = requireUser(db, userId);
+    const user = requireAuthenticatedUser(db, req, userId);
     if (!user) return sendError(res, 404, "找不到用户 session。");
     const weddingIds = db.weddingMembers.filter((member) => member.user_id === userId).map((member) => member.wedding_id);
     const weddings = db.weddings.filter((wedding) => weddingIds.includes(wedding.id));
@@ -345,36 +427,15 @@ async function handleApi(req, res, url) {
   }
 
   if (method === "POST" && url.pathname === "/api/bootstrap") {
-    // 首次使用（完全没有用户）：建立默认 Oliver + 空婚礼，并直接登入。
-    // 已有用户：不自动登入，返回用户列表让前端选择/登入，避免把伴侣的 session 盖掉。
-    let user = null;
-    let weddingId = "";
-    if (db.users.length === 0) {
-      user = { id: id("usr"), name: "Oliver", email: "oliver@local", created_at: nowIso() };
-      db.users.push(user);
-      const wedding = {
-        id: id("wed"),
-        name: "O&S 婚礼计划",
-        date: "",
-        total_budget: 0,
-        size_estimate: 0,
-        created_by: user.id,
-        updated_at: nowIso(),
-        created_at: nowIso()
-      };
-      db.weddings.push(wedding);
-      db.weddingMembers.push({ wedding_id: wedding.id, user_id: user.id, joined_at: nowIso() });
-      recordActivity(db, wedding.id, user.id, "created", "建立共享婚礼计划");
-      await writeDb(db);
-      weddingId = wedding.id;
-    }
-    const users = db.users.map((item) => ({ id: item.id, name: item.name, email: item.email }));
-    return sendJson(res, 200, { user, weddingId, users });
+    const setup = ensureFixedAccounts(db);
+    if (setup.changed) await writeDb(db);
+    const users = setup.accounts.map((item) => pick(item, ["id", "name", "email"]));
+    return sendJson(res, 200, { user: null, weddingId: setup.wedding.id, users });
   }
 
   if (method === "POST" && url.pathname === "/api/weddings") {
     const body = await parseBody(req);
-    if (!requireUser(db, body.userId)) return sendError(res, 401, "请先建立或登入用户。");
+    if (!requireAuthenticatedUser(db, req, body.userId)) return sendError(res, 401, "请先登入用户。");
 
     const wedding = {
       id: id("wed"),
@@ -417,7 +478,7 @@ async function handleApi(req, res, url) {
 
   if (method === "POST" && url.pathname === "/api/onboarding") {
     const body = await parseBody(req);
-    if (!requireUser(db, body.userId)) return sendError(res, 401, "请先建立或登入用户。");
+    if (!requireAuthenticatedUser(db, req, body.userId)) return sendError(res, 401, "请先登入用户。");
 
     const weddingDate = String(body.date || "").trim();
     const budget = sanitizeNumber(body.total_budget);
@@ -462,14 +523,14 @@ async function handleApi(req, res, url) {
   if (method === "GET" && parts[0] === "api" && parts[1] === "weddings" && parts.length === 3) {
     const weddingId = parts[2];
     const userId = url.searchParams.get("userId");
-    if (!requireMember(db, weddingId, userId)) return sendError(res, 403, "这个用户没有加入这份婚礼计划。");
+    if (!requireAuthenticatedMember(db, req, weddingId, userId)) return sendError(res, 403, "请以婚礼成员账号登入。");
     return sendJson(res, 200, weddingPayload(db, weddingId));
   }
 
   if (method === "PATCH" && parts[0] === "api" && parts[1] === "weddings" && parts.length === 3) {
     const weddingId = parts[2];
     const body = await parseBody(req);
-    if (!requireMember(db, weddingId, body.userId)) return sendError(res, 403, "这个用户没有加入这份婚礼计划。");
+    if (!requireAuthenticatedMember(db, req, weddingId, body.userId)) return sendError(res, 403, "请以婚礼成员账号登入。");
     const wedding = db.weddings.find((item) => item.id === weddingId);
     Object.assign(wedding, pick(body, ["name", "date"]));
     if (body.total_budget !== undefined) wedding.total_budget = sanitizeNumber(body.total_budget);
@@ -483,7 +544,7 @@ async function handleApi(req, res, url) {
   if (method === "POST" && parts[0] === "api" && parts[1] === "weddings" && parts[3] === "invites") {
     const weddingId = parts[2];
     const body = await parseBody(req);
-    if (!requireMember(db, weddingId, body.userId)) return sendError(res, 403, "这个用户没有加入这份婚礼计划。");
+    if (!requireAuthenticatedMember(db, req, weddingId, body.userId)) return sendError(res, 403, "请以婚礼成员账号登入。");
     const invite = {
       token: crypto.randomBytes(12).toString("hex"),
       wedding_id: weddingId,
@@ -500,7 +561,7 @@ async function handleApi(req, res, url) {
   if (method === "POST" && parts[0] === "api" && parts[1] === "weddings" && parts[3] === "ceremonies") {
     const weddingId = parts[2];
     const body = await parseBody(req);
-    if (!requireMember(db, weddingId, body.userId)) return sendError(res, 403, "这个用户没有加入这份婚礼计划。");
+    if (!requireAuthenticatedMember(db, req, weddingId, body.userId)) return sendError(res, 403, "请以婚礼成员账号登入。");
     const ceremony = {
       id: id("cer"),
       wedding_id: weddingId,
@@ -520,7 +581,7 @@ async function handleApi(req, res, url) {
   if (method === "POST" && parts[0] === "api" && parts[1] === "weddings" && parts[3] === "tasks") {
     const weddingId = parts[2];
     const body = await parseBody(req);
-    if (!requireMember(db, weddingId, body.userId)) return sendError(res, 403, "这个用户没有加入这份婚礼计划。");
+    if (!requireAuthenticatedMember(db, req, weddingId, body.userId)) return sendError(res, 403, "请以婚礼成员账号登入。");
     const task = {
       id: id("tsk"),
       wedding_id: weddingId,
@@ -544,7 +605,7 @@ async function handleApi(req, res, url) {
     const body = await parseBody(req);
     const task = db.tasks.find((item) => item.id === parts[2]);
     if (!task) return sendError(res, 404, "找不到这个待办。");
-    if (!requireMember(db, task.wedding_id, body.userId)) return sendError(res, 403, "这个用户没有加入这份婚礼计划。");
+    if (!requireAuthenticatedMember(db, req, task.wedding_id, body.userId)) return sendError(res, 403, "请以婚礼成员账号登入。");
     Object.assign(task, pick(body, ["title", "due_date", "group", "status", "ceremony_id", "assignee"]));
     task.updated_at = nowIso();
     recordActivity(db, task.wedding_id, body.userId, "updated", `更新待办：${task.title}`);
@@ -555,7 +616,7 @@ async function handleApi(req, res, url) {
   if (method === "POST" && parts[0] === "api" && parts[1] === "weddings" && parts[3] === "budget-items") {
     const weddingId = parts[2];
     const body = await parseBody(req);
-    if (!requireMember(db, weddingId, body.userId)) return sendError(res, 403, "这个用户没有加入这份婚礼计划。");
+    if (!requireAuthenticatedMember(db, req, weddingId, body.userId)) return sendError(res, 403, "请以婚礼成员账号登入。");
     const item = {
       id: id("bud"),
       wedding_id: weddingId,
@@ -576,7 +637,7 @@ async function handleApi(req, res, url) {
   if (method === "POST" && parts[0] === "api" && parts[1] === "weddings" && parts[3] === "guests") {
     const weddingId = parts[2];
     const body = await parseBody(req);
-    if (!requireMember(db, weddingId, body.userId)) return sendError(res, 403, "这个用户没有加入这份婚礼计划。");
+    if (!requireAuthenticatedMember(db, req, weddingId, body.userId)) return sendError(res, 403, "请以婚礼成员账号登入。");
     const guest = {
       id: id("gst"),
       wedding_id: weddingId,
@@ -600,7 +661,7 @@ async function handleApi(req, res, url) {
     const body = await parseBody(req);
     const guest = db.guests.find((item) => item.id === parts[2]);
     if (!guest) return sendError(res, 404, "找不到这个宾客。");
-    if (!requireMember(db, guest.wedding_id, body.userId)) return sendError(res, 403, "这个用户没有加入这份婚礼计划。");
+    if (!requireAuthenticatedMember(db, req, guest.wedding_id, body.userId)) return sendError(res, 403, "请以婚礼成员账号登入。");
     Object.assign(guest, pick(body, ["name", "status"]));
     if (Array.isArray(body.ceremony_ids)) {
       db.guestCeremonies = db.guestCeremonies.filter((link) => link.guest_id !== guest.id);
@@ -634,7 +695,7 @@ async function handleApi(req, res, url) {
     const invite = db.invites.find((item) => item.token === token);
     if (!invite) return sendError(res, 404, "找不到邀请链接。");
     if (new Date(invite.expires_at).getTime() < Date.now()) return sendError(res, 410, "邀请链接已过期。");
-    if (!requireUser(db, body.userId)) return sendError(res, 401, "请先建立或登入用户。");
+    if (!requireAuthenticatedUser(db, req, body.userId)) return sendError(res, 401, "请先登入用户。");
     const exists = db.weddingMembers.some((member) => member.wedding_id === invite.wedding_id && member.user_id === body.userId);
     if (!exists) db.weddingMembers.push({ wedding_id: invite.wedding_id, user_id: body.userId, joined_at: nowIso() });
     recordActivity(db, invite.wedding_id, body.userId, "joined", "加入了共享婚礼计划");
