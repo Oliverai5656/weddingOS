@@ -424,7 +424,10 @@ async function boot() {
       const session = await api(`/api/session?userId=${encodeURIComponent(userId)}`);
       state.user = session.user;
       state.weddings = session.weddings;
-      if (!state.weddingId && session.weddings[0]) state.weddingId = session.weddings[0].id;
+      const rememberedWeddingIsAvailable = session.weddings.some((wedding) => wedding.id === state.weddingId);
+      state.weddingId = rememberedWeddingIsAvailable ? state.weddingId : (session.weddings[0]?.id || "");
+      if (state.weddingId) localStorage.setItem("weddingId", state.weddingId);
+      else localStorage.removeItem("weddingId");
     } catch {
       localStorage.removeItem("userId");
       localStorage.removeItem("weddingId");
@@ -442,7 +445,12 @@ async function boot() {
     }
   }
   if (state.user && state.weddingId) {
-    await loadWedding(state.weddingId, false);
+    try {
+      await loadWedding(state.weddingId, false);
+    } catch (error) {
+      state.data = null;
+      state.message = `无法读取共享计划：${error.message}`;
+    }
   }
   if (!location.hash || !/^#\/(dashboard|manage)$/.test(location.hash)) {
     history.replaceState({}, "", "#/dashboard");
