@@ -4,7 +4,7 @@
   "functions": {
     "api/[...slug].js": {
       "memory": 256,
-      "maxDuration": 10
+      "maxDuration": 60
     }
   }
 }
