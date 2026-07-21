@@ -18,6 +18,8 @@ const LOCAL_DB_KEY = "os-wedding-live-db";
 const CACHED_USER_KEY = "os-wedding-user";
 const LAST_USERNAME_KEY = "os-wedding-last-username";
 const SESSION_TOKEN_KEY = "os-wedding-session-token";
+const LOCAL_MIGRATION_KEY = "os-wedding-local-migration-v1";
+const CANONICAL_WEDDING_DATE = "2027-09-11";
 const FIXED_ACCOUNTS = Object.freeze({
   oliver: { name: "Oliver", email: "oliver@local", passwordHash: "ac07ebf3bc8fa7cecc910f5bfa6a557c115eb2f0e3f391f9cf9aea11b5f7b005" },
   sherine: { name: "Sherine", email: "sherine@local", passwordHash: "3056d0479798773fe2da0d6e6afa18bd05bb6a9af2cb49b84519a647fe4649b0" }
@@ -64,16 +66,32 @@ async function api(path, options = {}) {
     if (!type.includes("application/json")) throw new Error("NO_API_BACKEND");
     const payload = await response.json();
     if (!response.ok) {
-      if (response.status >= 500) throw new Error("NO_API_BACKEND");
       const error = new Error(payload.error || "请求失败。");
       error.isApiResponse = true;
       throw error;
     }
     return payload;
   } catch (error) {
-    if (error.isApiResponse || (error.message !== "NO_API_BACKEND" && !path.startsWith("/api/"))) throw error;
-    return localApi(path, options);
+    if (error.isApiResponse) throw error;
+    throw new Error("共享云端暂时无法连接，请稍后刷新。为避免两人的资料分开，系统不会再改存到此设备。", { cause: error });
   }
+}
+
+async function migrateBrowserDataToShared(weddingId) {
+  if (!weddingId || localStorage.getItem(LOCAL_MIGRATION_KEY) === weddingId) return 0;
+  const localData = readLocalDb();
+  const meaningfulCount = ["ceremonies", "tasks", "budgetItems", "guests", "notes", "activity"]
+    .reduce((total, key) => total + (Array.isArray(localData[key]) ? localData[key].length : 0), 0);
+  if (!meaningfulCount) {
+    localStorage.setItem(LOCAL_MIGRATION_KEY, weddingId);
+    return 0;
+  }
+  const result = await api(`/api/weddings/${weddingId}/import-local`, {
+    method: "POST",
+    body: JSON.stringify({ userId: currentUserId(), data: localData })
+  });
+  localStorage.setItem(LOCAL_MIGRATION_KEY, weddingId);
+  return Number(result.imported || 0);
 }
 
 function emptyLocalDb() {
@@ -408,14 +426,12 @@ async function boot() {
       state.weddings = session.weddings;
       if (!state.weddingId && session.weddings[0]) state.weddingId = session.weddings[0].id;
     } catch {
-      const cached = readCachedUser();
-      if (cached && cached.id === userId) {
-        state.user = cached;
-      } else {
-        localStorage.removeItem("userId");
-        localStorage.removeItem("weddingId");
-        localStorage.removeItem(SESSION_TOKEN_KEY);
-      }
+      localStorage.removeItem("userId");
+      localStorage.removeItem("weddingId");
+      localStorage.removeItem(SESSION_TOKEN_KEY);
+      cacheUser(null);
+      state.user = null;
+      state.weddingId = "";
     }
   }
   if (state.inviteToken) {
@@ -519,7 +535,7 @@ function onboardingPanel() {
       </div>
       <form class="form-grid" data-form="onboarding">
         <div class="two-col">
-          <label>婚礼日期<input name="date" type="date" required></label>
+          <label>婚礼日期<input name="date" type="date" value="${CANONICAL_WEDDING_DATE}" required></label>
           <label>总预算 RM<input name="total_budget" type="number" min="0" value="50000"></label>
         </div>
         <label>预计宾客人数<input name="size_estimate" type="number" min="1" value="180" required></label>
@@ -1017,13 +1033,17 @@ app.addEventListener("submit", async (event) => {
       const session = await api(`/api/session?userId=${encodeURIComponent(result.user.id)}`);
       state.weddings = session.weddings;
       state.weddingId = session.weddings[0]?.id || "";
+      let imported = 0;
       if (state.weddingId) {
         localStorage.setItem("weddingId", state.weddingId);
+        imported = await migrateBrowserDataToShared(state.weddingId);
         await loadWedding(state.weddingId, false);
       }
       history.replaceState({}, "", "#/dashboard");
       state.view = "dashboard";
-      state.message = `已登入：${result.user.name}`;
+      state.message = imported
+        ? `已登入：${result.user.name}；并合并此设备原有的 ${imported} 项资料。`
+        : `已登入：${result.user.name}；现在使用两人共享资料。`;
     }
     if (kind === "onboarding") {
       state.data = await api("/api/onboarding", {
@@ -1148,4 +1168,17 @@ app.addEventListener("click", async (event) => {
   });
 
 
+async function refreshSharedDataInBackground() {
+  if (document.hidden || !state.user || !state.weddingId) return;
+  if (document.activeElement?.matches("input, select, textarea")) return;
+  try {
+    await loadWedding(state.weddingId, false);
+    render();
+  } catch {
+    // Keep the current screen intact; an explicit refresh will show the cloud error.
+  }
+}
+
 boot();
+setInterval(refreshSharedDataInBackground, 30_000);
+document.addEventListener("visibilitychange", refreshSharedDataInBackground);

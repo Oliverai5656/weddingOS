@@ -17,6 +17,7 @@ const FIXED_ACCOUNTS = Object.freeze({
   oliver: { name: "Oliver", email: "oliver@local", passwordHash: "ac07ebf3bc8fa7cecc910f5bfa6a557c115eb2f0e3f391f9cf9aea11b5f7b005" },
   sherine: { name: "Sherine", email: "sherine@local", passwordHash: "3056d0479798773fe2da0d6e6afa18bd05bb6a9af2cb49b84519a647fe4649b0" }
 });
+const CANONICAL_WEDDING_DATE = "2027-09-11";
 
 const emptyDb = () => ({
   users: [],
@@ -319,7 +320,18 @@ function ensureFixedAccounts(db) {
     return user;
   });
 
-  let wedding = db.weddings[0];
+  const fixedUserIds = new Set(accounts.map((user) => user.id));
+  const weddingScore = (wedding) => {
+    const weddingId = wedding.id;
+    const childCount = [db.ceremonies, db.tasks, db.budgetItems, db.guests, db.notes, db.activity]
+      .reduce((total, rows) => total + rows.filter((row) => row.wedding_id === weddingId).length, 0);
+    return childCount * 100
+      + (Number(wedding.total_budget) > 0 ? 10 : 0)
+      + (Number(wedding.size_estimate) > 0 ? 10 : 0)
+      + (wedding.date ? 1 : 0);
+  };
+  let wedding = [...db.weddings].sort((a, b) => weddingScore(b) - weddingScore(a)
+    || String(a.created_at).localeCompare(String(b.created_at)))[0];
   if (!wedding) {
     wedding = {
       id: id("wed"),
@@ -336,12 +348,55 @@ function ensureFixedAccounts(db) {
     changed = true;
   }
 
+  // Older builds could create one wedding per browser/account. Consolidate every
+  // existing plan into the most complete plan so both fixed accounts always see
+  // one canonical source of truth.
+  const duplicateIds = new Set(db.weddings.filter((item) => item.id !== wedding.id).map((item) => item.id));
+  if (duplicateIds.size) {
+    const newestUsefulWedding = [...db.weddings]
+      .filter((item) => item.id !== wedding.id)
+      .sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)))
+      .find((item) => Number(item.total_budget) > 0 || Number(item.size_estimate) > 0);
+    if (!Number(wedding.total_budget) && newestUsefulWedding?.total_budget) wedding.total_budget = newestUsefulWedding.total_budget;
+    if (!Number(wedding.size_estimate) && newestUsefulWedding?.size_estimate) wedding.size_estimate = newestUsefulWedding.size_estimate;
+
+    for (const rows of [db.ceremonies, db.tasks, db.budgetItems, db.guests, db.invites, db.notes, db.activity]) {
+      for (const row of rows) {
+        if (duplicateIds.has(row.wedding_id)) row.wedding_id = wedding.id;
+      }
+    }
+    for (const member of db.weddingMembers) {
+      if (duplicateIds.has(member.wedding_id)) member.wedding_id = wedding.id;
+    }
+    db.weddings = db.weddings.filter((item) => !duplicateIds.has(item.id));
+    changed = true;
+  }
+
+  const memberKeys = new Set();
+  db.weddingMembers = db.weddingMembers.filter((member) => {
+    if (fixedUserIds.has(member.user_id) && member.wedding_id !== wedding.id) return false;
+    const key = `${member.wedding_id}:${member.user_id}`;
+    if (memberKeys.has(key)) return false;
+    memberKeys.add(key);
+    return true;
+  });
   for (const user of accounts) {
-    const exists = db.weddingMembers.some((member) => member.wedding_id === wedding.id && member.user_id === user.id);
-    if (!exists) {
+    const key = `${wedding.id}:${user.id}`;
+    if (!memberKeys.has(key)) {
       db.weddingMembers.push({ wedding_id: wedding.id, user_id: user.id, joined_at: nowIso() });
+      memberKeys.add(key);
       changed = true;
     }
+  }
+
+  if (wedding.date !== CANONICAL_WEDDING_DATE) {
+    wedding.date = CANONICAL_WEDDING_DATE;
+    wedding.updated_at = nowIso();
+    recordActivity(db, wedding.id, null, "updated", "系统统一婚礼日期为 2027 年 9 月 11 日");
+    changed = true;
+  }
+  if (duplicateIds.size) {
+    recordActivity(db, wedding.id, null, "merged", "系统已把两位账号的婚礼资料合并为同一份共享计划");
   }
   return { accounts, wedding, changed };
 }
@@ -387,9 +442,99 @@ function weddingPayload(db, weddingId) {
       .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
       .map((item) => ({
         ...item,
-        user_name: db.users.find((user) => user.id === item.user_id)?.name || "Partner"
+        user_name: db.users.find((user) => user.id === item.user_id)?.name || "系统"
       }))
   };
+}
+
+function importBrowserLocalData(db, weddingId, userId, source) {
+  if (!source || typeof source !== "object") return 0;
+  let imported = 0;
+  const sourceUsers = new Map((Array.isArray(source.users) ? source.users : []).map((user) => [user.id, user]));
+  const fixedUsersByName = new Map(db.users.map((user) => [String(user.name || "").toLowerCase(), user.id]));
+  const cleanId = (value, prefix) => String(value || "").startsWith(`${prefix}_`) ? String(value) : id(prefix);
+  const cleanDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || "")) ? String(value) : "";
+  const addUnique = (key, row) => {
+    if (db[key].some((item) => item.id === row.id)) return false;
+    db[key].push(row);
+    imported += 1;
+    return true;
+  };
+
+  const localWedding = (Array.isArray(source.weddings) ? source.weddings : [])[0];
+  const wedding = db.weddings.find((item) => item.id === weddingId);
+  if (wedding && localWedding) {
+    if (!Number(wedding.total_budget) && Number(localWedding.total_budget) > 0) wedding.total_budget = sanitizeNumber(localWedding.total_budget);
+    if (!Number(wedding.size_estimate) && Number(localWedding.size_estimate) > 0) wedding.size_estimate = sanitizeNumber(localWedding.size_estimate);
+  }
+
+  for (const item of Array.isArray(source.ceremonies) ? source.ceremonies : []) {
+    const name = String(item.name || "").trim();
+    if (!name) continue;
+    addUnique("ceremonies", {
+      id: cleanId(item.id, "cer"), wedding_id: weddingId, name,
+      type: String(item.type || "ceremony").trim(), date: cleanDate(item.date),
+      updated_at: item.updated_at || nowIso(), created_at: item.created_at || nowIso()
+    });
+  }
+  const ceremonyIds = new Set(db.ceremonies.filter((item) => item.wedding_id === weddingId).map((item) => item.id));
+
+  for (const item of Array.isArray(source.tasks) ? source.tasks : []) {
+    const title = String(item.title || "").trim();
+    if (!title) continue;
+    addUnique("tasks", {
+      id: cleanId(item.id, "tsk"), wedding_id: weddingId,
+      ceremony_id: ceremonyIds.has(item.ceremony_id) ? item.ceremony_id : null,
+      title, due_date: cleanDate(item.due_date),
+      group: ["now", "soon", "later"].includes(item.group) ? item.group : "now",
+      status: item.status === "done" ? "done" : "open", assignee: null,
+      updated_at: item.updated_at || nowIso(), created_at: item.created_at || nowIso()
+    });
+  }
+  for (const item of Array.isArray(source.budgetItems) ? source.budgetItems : []) {
+    const category = String(item.category || "").trim();
+    if (!category) continue;
+    addUnique("budgetItems", {
+      id: cleanId(item.id, "bud"), wedding_id: weddingId, category,
+      planned_amount: sanitizeNumber(item.planned_amount),
+      actual_amount: item.actual_amount === null || item.actual_amount === "" ? null : sanitizeNumber(item.actual_amount),
+      type: item.type === "income" ? "income" : "expense",
+      updated_at: item.updated_at || nowIso(), created_at: item.created_at || nowIso()
+    });
+  }
+  for (const item of Array.isArray(source.guests) ? source.guests : []) {
+    const name = String(item.name || "").trim();
+    if (!name) continue;
+    addUnique("guests", {
+      id: cleanId(item.id, "gst"), wedding_id: weddingId, name,
+      status: ["invited", "confirmed", "declined"].includes(item.status) ? item.status : "invited",
+      updated_at: item.updated_at || nowIso(), created_at: item.created_at || nowIso()
+    });
+  }
+  const guestIds = new Set(db.guests.filter((item) => item.wedding_id === weddingId).map((item) => item.id));
+  for (const link of Array.isArray(source.guestCeremonies) ? source.guestCeremonies : []) {
+    if (!guestIds.has(link.guest_id) || !ceremonyIds.has(link.ceremony_id)) continue;
+    if (db.guestCeremonies.some((item) => item.guest_id === link.guest_id && item.ceremony_id === link.ceremony_id)) continue;
+    db.guestCeremonies.push({ guest_id: link.guest_id, ceremony_id: link.ceremony_id });
+    imported += 1;
+  }
+  for (const item of Array.isArray(source.notes) ? source.notes : []) {
+    const content = String(item.content || "").trim();
+    if (!content) continue;
+    addUnique("notes", { id: cleanId(item.id, "note"), wedding_id: weddingId, content, created_at: item.created_at || nowIso() });
+  }
+  for (const item of Array.isArray(source.activity) ? source.activity : []) {
+    const label = String(item.label || "").trim();
+    if (!label) continue;
+    const sourceName = sourceUsers.get(item.user_id)?.name;
+    const mappedUserId = fixedUsersByName.get(String(sourceName || "").toLowerCase()) || userId;
+    addUnique("activity", {
+      id: cleanId(item.id, "act"), wedding_id: weddingId, user_id: mappedUserId,
+      action: String(item.action || "updated"), label, created_at: item.created_at || nowIso()
+    });
+  }
+  if (imported > 0) recordActivity(db, weddingId, userId, "imported", `合并了此设备原有资料（${imported} 项）`);
+  return imported;
 }
 
 async function handleApi(req, res, url) {
@@ -539,6 +684,18 @@ async function handleApi(req, res, url) {
     recordActivity(db, weddingId, body.userId, "updated", "更新了婚礼资料");
     await writeDb(db);
     return sendJson(res, 200, weddingPayload(db, weddingId));
+  }
+
+  if (method === "POST" && parts[0] === "api" && parts[1] === "weddings" && parts[3] === "import-local") {
+    const weddingId = parts[2];
+    const body = await parseBody(req);
+    if (!requireAuthenticatedMember(db, req, weddingId, body.userId)) return sendError(res, 403, "请以婚礼成员账号登入。");
+    const imported = importBrowserLocalData(db, weddingId, body.userId, body.data);
+    const wedding = db.weddings.find((item) => item.id === weddingId);
+    wedding.date = CANONICAL_WEDDING_DATE;
+    wedding.updated_at = nowIso();
+    if (imported > 0) await writeDb(db);
+    return sendJson(res, 200, { imported, data: weddingPayload(db, weddingId) });
   }
 
   if (method === "POST" && parts[0] === "api" && parts[1] === "weddings" && parts[3] === "invites") {
