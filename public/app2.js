@@ -469,6 +469,7 @@ async function loadWedding(weddingId, shouldRender = true) {
 function topbar() {
   const user = state.user;
   const wedding = state.data?.wedding;
+  const latestUpdate = state.data?.activity?.[0]?.created_at;
   return `
     <header class="topbar">
       <div class="brand ${wedding ? "brand-title" : ""}">
@@ -478,8 +479,11 @@ function topbar() {
           <p>${wedding ? `${escapeHtml(wedding.date || "未设日期")} · O&S 婚礼更新与追踪` : "两个人一起更新、追踪和确认婚礼进度。"}</p>
         </div>
       </div>
-      <div class="userbar">
+      <div class="topbar-actions">
+        ${wedding ? `<span class="sync-state" title="共享资料已连接云端"><i></i>${latestUpdate ? `最近同步 ${escapeHtml(activityTime(latestUpdate))}` : "共享资料已同步"}</span>` : ""}
+        <div class="userbar">
         ${user ? `<span class="tag">${escapeHtml(user.name)} - ${escapeHtml(user.email)}</span><button class="ghost" data-action="logout">退出</button>` : ""}
+        </div>
       </div>
     </header>
   `;
